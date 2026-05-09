@@ -1,0 +1,1252 @@
+    
+@router.get("/post/search", response_model = PaginatedPostSearch)
+async def search_item_by_title(title : Annotated[str, Query(min_length=1, max_length=100)],
+                                    current_user: CurrentUser,
+                                    db: Annotated[AsyncSession, Depends(get_db)],
+                                    skip : Annotated[int, Query(ge=0)] = 0,
+                                    limit : Annotated[int, Query(ge=1, le=100)] = settings.users_per_page
+                                ):
+
+    count_result = await db.execute(select(func.count(models.Item.title)).where(models.Item.title.ilike(f"%{title}%")))
+
+    total_items = count_result.scalar() or 0
+
+    if( total_items == 0):
+
+        return PaginatedPostSearch(
+            items = [],
+            total = 0,
+            skip= skip,
+            limit = limit,
+            has_more = False
+        )
+
+    result = await db.execute(
+        select(models.Item)
+        .where(models.Item.title.ilike(f"%{title}%"))
+        .order_by(models.Item.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        )
+
+    items =result.scalars().all()
+
+    has_more = skip + len(items) < total_items
+
+    return PaginatedPostSearch(
+        items = [PostMini.model_validate(item) for item in items],
+        total = total_items,
+        skip = skip,
+        limit = limit,
+        has_more = has_more
+    )
+
+@router.get("/posts/search", response_model=PaginatedPostSearch)
+async def search_posts_by_tags(
+    tags: str,   # "python,fastapi"
+    db: AsyncSession = Depends(get_db),
+    skip: int = 0,
+    limit: int = 10
+):
+    tag_list = [t.strip().lower() for t in tags.split(",")]
+
+
+    query  = (
+        select(models.Item)
+        .join(models.Item.tags)
+        .where(func.lower(models.Tag.name).in_(tag_list))
+        .group_by(models.Item.id)
+        .where(func.lower(models.Tag.name).in_(tag_list))  # match any tag
+        .options(
+            selectinload(models.Item.tags),
+            selectinload(models.Item.author)
+        )
+        .order_by(func.count(models.Tag.id).desc())
+        .offset(skip)
+        .limit(limit)
+    )
+
+    result = await db.execute(query)
+    posts = result.scalars().all()
+
+    return PaginatedPostSearch(
+        items=[PostMini.model_validate(p) for p in posts],
+        skip=skip,
+        limit=limit,
+        has_more=len(posts) == limit
+    )
+
+    #-----------------------------------------------------
+    ITEM.python
+    #-----------------------------------------------------
+
+    from fastapi import APIRouter, status, HTTPException, Depends, Query
+from typing import Annotated
+from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
+from database import get_db
+from schemas import ItemResponseMini, ItemCreate, TagMini, ItemResponse, ItemUpdate, ItemUpdateResponse, ItemTagUpdate, PaginatedItemResponse, CommentResponse,PaginatedCommentResponse, LikeResponse, PaginatedLikeResponse, BookmarkResponse, PaginatedBookmarkResponse, CommentCreate, CommentCreateResponse
+from auth import CurrentUser
+import models
+from config import settings
+
+router = APIRouter(prefix="/api/items")
+
+
+# @router.get("/{item_id}/data")
+# async def get_item_data(item_id: int,
+#                         db: Annotated[AsyncSession, Depends(get_db)]
+#                         ):
+    
+
+
+
+@router.get("", response_model=PaginatedItemResponse)
+async def get_posts(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int,  Query(ge=1, le=100)]= settings.post_per_page
+    ):
+
+    count_result = await db.execute(select(func.count()).select_from(models.Item).where(models.Item.is_public==True))
+    total = count_result.scalar() or 0
+
+    result = await db.execute(
+        select(models.Item)
+        .options(selectinload(models.Item.tags))
+        .where(models.Item.is_public == True)
+        .order_by(models.Item.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+
+    items = result.scalars().all()
+
+    has_more = skip + len(items) < total
+
+    return PaginatedItemResponse(
+        items = [ItemResponseMini.model_validate(item) for item in items],
+        total = total,
+        skip = skip,
+        limit = limit,
+        has_more = has_more
+
+    )
+
+# -----------------
+# create a post
+# -----------------
+@router.post("", status_code=status.HTTP_201_CREATED, response_model=ItemResponseMini)
+async def create_post(
+    item_data: ItemCreate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: CurrentUser,
+):
+    result = await db.execute(
+        select(models.Item).where(
+            func.lower(models.Item.title) == item_data.title.lower(),
+            models.Item.user_id == current_user.id,
+        )
+    )
+
+    existing_item = result.scalars().first()
+
+    if existing_item:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Item with same title already exists",
+        )
+
+    new_item = models.Item(
+        title=item_data.title,
+        content=item_data.content,
+        is_public=item_data.is_public,
+        user_id=current_user.id,
+    )
+
+    if item_data.tag_ids:
+
+        result = await db.execute(
+            select(models.Tag).where(models.Tag.id.in_(item_data.tag_ids))
+        )
+
+        tags = result.scalars().all()
+
+        if len(tags) != len(item_data.tag_ids):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="some tags are invalid"
+            )
+
+        new_item.tags = tags
+
+    db.add(new_item)
+    await db.commit()
+
+    #adding the frist version
+
+    version = models.Version(
+        item_id = new_item.id,
+        version_number = 1,
+        title = new_item.title,
+        content = new_item.content
+
+    )
+
+    db.add(version)
+    await db.commit()
+
+
+    # pre-loading the tags for return object
+    result = await db.execute(
+        select(models.Item)
+        .options(selectinload(models.Item.tags))
+        .where(models.Item.id == new_item.id)
+    )
+
+    item_with_tags = result.scalars().first()
+
+    return item_with_tags
+
+
+# -------------------------
+# get item by id
+# -------------------------
+@router.get("/{item_id}", response_model=ItemResponse)
+async def get_item_by_id(item_id: int, db: Annotated[AsyncSession, Depends(get_db)]):
+
+    result = await db.execute(
+        select(models.Item)
+        .options(selectinload(models.Item.tags))
+        .where(models.Item.id == item_id)
+    )
+
+    item = result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Item dosent exists"
+        )
+
+    if item.is_public == False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access the post",
+        )
+
+    # the counts
+
+    likes_count = await db.scalar(
+        select(func.count(models.Like.item_id)).where(models.Like.item_id == item_id)
+    )
+
+    comments_count = await db.scalar(
+        select(func.count(models.Comment.id)).where(models.Comment.item_id == item_id)
+    )
+
+    bookmarks_count = await db.scalar(
+        select(func.count(models.Bookmark.item_id)).where(
+            models.Bookmark.item_id == item_id
+        )
+    )
+
+    versions_count = await db.scalar(
+        select(func.count(models.Version.id)).where(models.Version.item_id == item_id)
+    )
+
+    # fetching the latest version
+
+    result = await db.execute(
+        select(models.Version)
+        .where(models.Version.item_id == item_id)
+        .order_by(models.Version.version_number.desc())
+        .limit(1)
+    )
+
+    latest_version = result.scalars().first()
+
+    return {
+        "id": item_id,
+        "user_id" : item.user_id,
+        "title": item.title,
+        "content": item.content,
+        "is_public": item.is_public,
+        "created_at": item.created_at,
+        "tags": item.tags,
+        "likes_count": likes_count,
+        "comments_count": comments_count,
+        "version_count": versions_count,
+        "latest_version": latest_version,
+    }
+
+
+#-------------------
+# Update-item
+#-------------------
+
+@router.patch("/{item_id}",
+            status_code= status.HTTP_200_OK,
+            response_model= ItemUpdateResponse
+        )
+async def update_item_version(item_id : int, data: ItemUpdate, db: Annotated[AsyncSession, Depends(get_db)], current_user : CurrentUser):
+
+    result = await db.execute(select(models.Item).where(models.Item.id == item_id))
+
+    item = result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    if item.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access the Item",
+        )
+    
+    latest_version = await db.scalar(
+        select(func.max(models.Version.version_number))
+               .where(models.Version.item_id == item_id)
+    )
+
+    if data.content == item.content and data.title == item.title :
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Can't update the item with same content or title",
+        )
+    
+    updated_title = data.title if data.title else item.title
+    updated_content = data.content if data.content else item.content
+    new_version = models.Version(
+        item_id = item_id,
+        version_number = latest_version + 1,
+        title = updated_title,
+        content = updated_content
+
+    )
+
+    item.title =  updated_title
+    item.content = updated_content
+
+    db.add(new_version)
+    await db.commit()
+    await db.refresh(new_version)
+
+   
+
+    return new_version
+
+#---------------
+#update item tags
+#--------------
+@router.patch("/{item_id}/tags", response_model= ItemResponseMini)
+async def update_item_tag(item_id : int, data: ItemTagUpdate,db: Annotated[AsyncSession, Depends(get_db)], current_user : CurrentUser):
+
+    result = await db.execute(select(models.Item).options(selectinload(models.Item.tags)).where(models.Item.id == item_id))
+
+    item = result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    if item.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access the Item",
+        )
+    
+    result = await db.execute(select(models.Tag).where(models.Tag.id.in_(data.tags)))
+
+    tags = result.scalars().all()
+
+    if len(tags) != len(data.tags) :
+        raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="some tags are invalid"
+            )
+    
+    item.tags = tags
+
+    await db.commit()
+
+    result  = await db.execute(select(models.Item).options(selectinload(models.Item.tags)).where(models.Item.id == item_id))
+    item = result.scalars().first()
+
+    return item
+
+#--------------------
+#delete item
+#-------------------
+
+@router.delete("/{item_id}", status_code= status.HTTP_204_NO_CONTENT)
+async def delete_item(item_id: int , current_user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]):
+
+    result = await db.execute(select(models.Item).options(selectinload(models.Item.tags)).where(models.Item.id == item_id))
+
+    item = result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    if item.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access the Item",
+        )
+    
+
+    await db.delete(item)
+    await db.commit()
+
+
+#-----------------------------
+# GETTING COMMENTS FOR AN ITEM
+#-----------------------------
+@router.get("/{item_id}/comments", response_model = PaginatedCommentResponse)
+async def get_comments_by_id(
+    item_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    skip : Annotated[int, Query(ge=0)]=0,
+    limit : Annotated[int, Query(ge=1, le=100)] = settings.comment_per_page):
+
+    result = await db.execute(select(models.Item).where(models.Item.id == item_id))
+
+    item = result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    count_result = await db.execute(select(func.count()).select_from(models.Comment).where(models.Comment.item_id==item_id))
+
+    total_comments = count_result.scalar() or 0
+
+    result = await db.execute(select(models.Comment)
+                              .where(models.Comment.item_id == item_id)
+                              .order_by(models.Comment.created_at.desc())
+                              .offset(skip)
+                              .limit(limit)
+                              )
+
+    comments = result.scalars().all()
+
+    has_more = skip + len(comments) < total_comments
+
+    return PaginatedCommentResponse(
+
+        comments = [CommentResponse.model_validate(comment) for comment in comments],
+        total = total_comments,
+        skip = skip,
+        limit = limit,
+        has_more = has_more
+    )
+
+#-----------------------------
+# GETTING LIKES FOR AN ITEM
+#-----------------------------
+
+@router.get("/{item_id}/likes", response_model= PaginatedLikeResponse)
+async def get_likes_by_id(item_id: int,
+                        db: Annotated[AsyncSession, Depends(get_db)],
+                        skip : Annotated[int, Query(ge=0)]=0,
+                        limit : Annotated[int, Query(ge=1, le=100)] = settings.likes_per_page):
+
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+
+    like_result = await db.execute(
+    select(func.count())
+    .where(models.Like.item_id == item_id)
+    )
+    
+
+    total_likes = like_result.scalar() or 0
+
+
+    result = await db.execute(
+        select(models.Like)
+        .where(models.Like.item_id== item_id)
+        .options(selectinload(models.Like.user))
+        .order_by(models.Like.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    
+    likes = result.scalars().all()
+
+    has_more = skip + len(likes) < total_likes
+
+
+    return PaginatedLikeResponse(
+        item_id = item_id,
+        likes = [LikeResponse.model_validate(like) for like in likes],
+        total_likes = total_likes,
+        skip = skip,
+        limit = limit,
+        has_more = has_more
+    )
+    
+
+#-----------------------------
+# GETTING BOOKMARKS FOR AN ITEM
+#-----------------------------
+@router.get("/{item_id}/bookmarks", response_model= PaginatedBookmarkResponse)
+async def get_bookmarks_by_id(item_id: int,
+                        db: Annotated[AsyncSession, Depends(get_db)],
+                        skip : Annotated[int, Query(ge=0)]=0,
+                        limit : Annotated[int, Query(ge=1, le=100)] = settings.likes_per_page):
+
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+
+    bookmark_result = await db.execute(select(func.count(models.Bookmark.item_id))
+            .where(models.Bookmark.item_id == item_id)
+    )
+    
+
+    total_bookmarks = bookmark_result.scalar() or 0
+
+
+    result = await db.execute(
+        select(models.Bookmark)
+        .where(models.Bookmark.item_id== item_id)
+        .options(selectinload(models.Bookmark.user))
+        .order_by(models.Bookmark.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    
+    bookmarks = result.scalars().all()
+
+    has_more = skip + len(bookmarks) < total_bookmarks
+
+
+    return PaginatedBookmarkResponse(
+        item_id = item_id,
+        bookmarks = [BookmarkResponse.model_validate(bookmark) for bookmark in bookmarks],
+        total_bookmarks = total_bookmarks,
+        skip = skip,
+        limit = limit,
+        has_more = has_more
+    )
+    
+
+
+@router.post("/{item_id}/like", status_code= status.HTTP_201_CREATED, response_model= LikeResponse)
+async def like_item(item_id: int,
+                    db: Annotated[AsyncSession, Depends(get_db)],
+                    current_user: CurrentUser 
+                ):
+    
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    like_result = await db.execute(
+        select(models.Like)
+        .where(models.Like.user_id==current_user.id,
+               models.Like.item_id == item_id
+               )
+    )
+
+    existing_like = like_result.scalars().first()
+
+    if existing_like:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Item already liked"
+        )
+    
+
+    like = models.Like(
+        user_id = current_user.id,
+        item_id = item_id
+    )
+
+    db.add(like)
+    await db.commit()
+    db.refresh(like)
+
+
+    return LikeResponse(
+        user= current_user,
+        item_id = item_id,
+        created_at = like.created_at
+    )
+
+@router.delete("/{item_id}/like", status_code= status.HTTP_204_NO_CONTENT)
+async def unlike_item(item_id: int,
+                    db: Annotated[AsyncSession, Depends(get_db)],
+                    current_user: CurrentUser 
+                ):
+    
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    existing_like = await db.execute(
+        select(models.Like)
+        .where(models.Like.user_id==current_user.id,
+               models.Like.item_id == item_id
+               )
+    )
+
+    like = existing_like.scalars().first()
+
+    if not like:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Item is not Liked"
+        )
+    
+
+    await db.delete(like)
+    await db.commit()
+ 
+
+
+
+@router.post("/{item_id}/bookmark", status_code= status.HTTP_201_CREATED, response_model= BookmarkResponse)
+async def bookmark_item(item_id: int,
+                    db: Annotated[AsyncSession, Depends(get_db)],
+                    current_user: CurrentUser 
+                ):
+    
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    result  = await db.execute(
+        select(models.Bookmark)
+        .where(models.Bookmark.user_id==current_user.id,
+               models.Bookmark.item_id == item_id
+               )
+    )
+
+    existing_bookmark = result.scalars().first()
+
+    if existing_bookmark:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Item already bookmarked"
+        )
+    
+
+    bookmark = models.Bookmark(
+        user_id = current_user.id,
+        item_id = item_id
+    )
+
+    db.add(bookmark)
+    await db.commit()
+    db.refresh(bookmark)
+
+
+    return BookmarkResponse(
+        user= current_user,
+        item_id = item_id,
+        created_at = bookmark.created_at
+    )
+
+
+@router.delete("/{item_id}/bookmark", status_code= status.HTTP_204_NO_CONTENT)
+async def unbookmark_item(item_id: int,
+                    db: Annotated[AsyncSession, Depends(get_db)],
+                    current_user: CurrentUser 
+                ):
+    
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    existing_bookmark = await db.execute(
+        select(models.Bookmark)
+        .where(models.Bookmark.user_id==current_user.id,
+               models.Bookmark.item_id == item_id
+               )
+    )
+
+    bookmark = existing_bookmark.scalars().first()
+
+    if not bookmark:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Item Not Bookmarked"
+        )
+    
+
+    await db.delete(bookmark)
+    await db.commit()
+    
+    
+@router.post("/{item_id}/comment", status_code= status.HTTP_201_CREATED, response_model= CommentCreateResponse)
+async def comment_item(item_id: int,
+                    data: CommentCreate,
+                    db: Annotated[AsyncSession, Depends(get_db)],
+                    current_user: CurrentUser 
+                ):
+    
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    result = await db.execute(
+        select(models.Comment)
+        .where(models.Comment.user_id==current_user.id,
+               models.Comment.item_id == item_id
+               )
+    )
+
+    existing_comment = result.scalars().first()
+
+    if existing_comment:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Item already Commented"
+        )
+    
+
+    comment = models.Comment(
+        user_id = current_user.id,
+        content = data.content,
+        item_id = item_id
+    )
+
+    db.add(comment)
+    await db.commit()
+    db.refresh(comment)
+
+
+    return CommentCreateResponse(
+        id = comment.id,
+        user= current_user,
+        item_id = item_id,
+        content = comment.content,
+        created_at = comment.created_at
+    )
+
+
+    
+@router.delete("/{item_id}/comment/{comment_id}", status_code= status.HTTP_204_NO_CONTENT)
+async def uncomment_item(item_id: int,
+                         comment_id: int,
+                    db: Annotated[AsyncSession, Depends(get_db)],
+                    current_user: CurrentUser 
+                ):
+    
+    item_result = await db.execute(select(models.Item.id).where(models.Item.id == item_id))
+
+    item = item_result.scalars().first()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    
+    existing_comment = await db.execute(
+        select(models.Comment)
+        .where(models.Comment.id == comment_id,
+                models.Comment.user_id == current_user.id,
+                models.Comment.item_id == item_id
+                )
+    )
+
+    comment = existing_comment.scalars().first()
+    if not comment :
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Comment dosent Exists"
+        )
+    
+
+    await db.delete(comment)
+    await db.commit()
+    
+
+
+--------------------------------------------------
+                 schemas.python
+--------------------------------------------------
+from __future__ import annotations
+from datetime import datetime
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+#Base that we created in the database its used in model creation
+#& for schema we need BaseModel 
+# Filed we need to import from pydantic , cause itys used for schema 
+#or pydantuc model and Query is ysed in the endpint
+
+class BaseSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)                    
+
+class Token(BaseModel):
+    access_token : str
+    token_type : str
+    
+class Userbase(BaseSchema):
+    username : str = Field(min_length =1, max_length = 20)
+    email : EmailStr 
+
+
+
+class UserCreate(Userbase):
+    password : str = Field(min_length=8)
+    bio : str | None = Field(default=None, min_length=1, max_length=500)
+
+class UserPublic(BaseSchema):
+    
+    id : int
+    username : str
+    image_path : str
+
+     
+
+class UserMini(BaseSchema): # will be used in follow/following_list
+                        # bookmarks - lite item  response
+                        # likes same -light item response
+                        # comments same light item response
+                  
+    id : int
+    username : str
+    image_path : str
+
+class UserProfile(UserPublic):
+    bio: str
+    # following_count: int
+
+# class TempResponse(BaseModel):
+#     model_config = ConfigDict(from_attributes=True)
+
+#     id : int
+#     username: str
+#     email : str
+
+class UserPrivate(UserPublic):
+    email: EmailStr
+    bio : str | None 
+    created_at : datetime
+
+
+
+class UserUpdate(BaseModel):
+
+    username : str | None = Field(default = None, min_length =5, max_length=20)
+    email : EmailStr | None = None
+    bio : str | None = Field(default = None, min_length = 1, max_length=500)
+
+
+class ItemBase(BaseModel):
+    model_config = ConfigDict(from_attributes=True)                    
+
+    title: str = Field(min_length= 1, max_length=100) # in db model ive used Text cant define texts size so should i use VARCHAR(100) instaed??
+    content : str = Field(min_length=4)
+
+class ItemCreate(ItemBase):
+    is_public : bool = True 
+    tag_ids : list[int] = Field(min_length=0, max_length=10)
+
+class ItemUpdate(BaseSchema):
+    title : str | None = Field(default = None, min_length =1 , max_length=100)
+    content : str | None = Field(default = None, min_length=4)
+    # is_public : bool | None = None
+    # tags: list[int] | None =  # ?? should i allow updating tags , the best and lighest option is to take the int tag ids , how how wre the users going to know that 
+    # and this is an api first , so need to figure that out like how are they going to send in and remember the tag ids
+
+class ItemResponseMini(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id : int
+    title: str
+    content: str
+    is_public : bool
+    tags: list[TagMini]
+    
+
+class ItemUpdateResponse(BaseSchema):
+    id : int
+    title : str
+    content : str
+    version_number : int
+    edited_at : datetime
+
+class ItemTagUpdate(BaseSchema):
+
+    tags: list[int] = Field(min_length=1, max_length=10)
+
+class ItemResponse(ItemBase):
+
+    model_config = ConfigDict(from_attributes= True)
+
+    id : int
+    user_id : int
+    created_at : datetime
+    tags : list[TagMini] 
+    created_at: datetime
+    likes_count : int
+    comments_count : int
+    version_count : int
+    latest_version : VersionResponse
+
+class FeedItemResponse(ItemBase):
+
+    model_config = ConfigDict(from_attributes= True)
+
+    id : int
+    user_id : int
+    created_at : datetime
+    tags : list[TagMini] 
+    created_at: datetime
+    likes_count : int
+    comments_count : int
+    versions_count : int
+
+
+class PaginatedFeedResponse(BaseSchema):
+
+    items : list[FeedItemResponse]
+    total : int
+    skip : int
+    limit : int
+    has_more : bool
+
+class ItemMini(BaseSchema):
+
+    
+    id : int
+    title : str
+    content : str
+    user_id : int
+    likes_count : int
+    bookmarks_count : int
+
+class PaginatedItemResponse(BaseSchema):
+
+    items : list[ItemResponseMini]
+    total : int
+    skip : int
+    limit : int
+    has_more : bool
+
+#------------------------------
+#Tag related schemas
+#------------------------------
+class TagCreate(BaseSchema):
+
+    name : str = Field(min_length = 1, max_length=120)
+
+
+class TagCreateResponse(TagCreate):
+
+    id : int
+    creator_id : int
+    created_at : datetime
+
+class TagMini(BaseSchema):
+                  
+    id : int
+    name : str
+
+
+
+class PaginatedItemResponse(BaseSchema):
+
+    items : list[ItemResponseMini]
+    total : int
+    skip : int
+    limit : int
+    has_more : bool
+
+class TagBase(BaseSchema):             
+
+    name: str
+    # creator_id : int #will get it from the token
+    # Question - in apis can we extract the user id from the authtoken (jwt token if we use user_id in that to authenticate??)
+    # craeted_at - automaically db generates it
+
+
+class BookmarkCreate(BaseSchema):                   
+
+    # user_id : int  - will get from the auth token
+    item_id : int # does the front end automatically sends it?
+    # created_at  - autogenerated by the db
+
+# note - for fetching the items bookmarked by user
+class UserBookmarkResponse(BookmarkCreate): # used for get users bookmark
+                                    # for all the user that bookmarked a post we'll use the usermini response model
+    id : int
+    item : ItemMini
+    bookmarked_at : datetime
+
+class PaginatedUserBookmarkResponse(BaseSchema):
+
+    items : list[UserBookmarkResponse]
+    total :int
+    skip : int
+    limit : int
+    has_more : bool
+
+class LikeResponse(BaseSchema):
+
+    user : UserMini
+    item_id : int
+    created_at : datetime
+
+class PaginatedLikeResponse(BaseSchema):
+                 
+    item_id : int
+    likes : list[LikeResponse]
+    total_likes : int
+    skip: int
+    limit : int
+    has_more : bool
+
+class BookmarkResponse(BaseSchema):
+
+    user : UserMini
+    item_id : int
+    created_at : datetime
+
+
+# Note - for fetching all the users that has bookmarked a item
+class PaginatedBookmarkResponse(BaseSchema):
+                 
+    item_id : int
+    bookmarks : list[BookmarkResponse]
+    total_bookmarks : int
+    skip: int
+    limit : int
+    has_more : bool
+class CommentCreate(BaseSchema):              
+
+    content : str = Field(min_length=1, max_length=500)
+
+class CommentCreateResponse(CommentCreate):
+
+    id : int
+    user : UserMini
+    content : str 
+    created_at : datetime
+
+class FollowCreate(BaseSchema):                   
+
+    followed_id : int
+
+class FollowResponse(FollowCreate):
+
+    user_id : int
+    followed_at : datetime
+
+
+class VersionResponse(BaseSchema):
+
+    version_number : int
+    edited_at : datetime
+
+class CommentResponse(BaseSchema):
+
+    id: int
+    user_id : int
+    content : str
+    created_at : datetime
+
+class PaginatedCommentResponse(BaseSchema):
+
+    comments : list[CommentResponse]
+    total : int
+    skip :int
+    limit : int
+    has_more : bool
+
+
+
+-------------------------------------
+feed.py
+-------------------------------------
+from fastapi import APIRouter, Depends, Query
+from typing import Annotated, Optional
+from sqlalchemy import select, func, case
+from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
+from database import get_db
+from schemas import PaginatedFeedResponse
+from auth import get_current_user_optional
+import models
+from config import settings
+
+router = APIRouter(prefix="/api/feed")
+
+@router.get("", response_model=PaginatedFeedResponse)
+async def get_feed(
+    db: Annotated[AsyncSession,Depends(get_db)],
+    skip : Annotated[int, Query(ge=0)] = 0,
+    limit : Annotated[int, Query(ge=1, le=100)] = settings.post_per_page,
+    current_user: Optional[models.User] = Depends(get_current_user_optional)
+):
+
+    count_result = await db.execute(select(func.count()).select_from(models.Item).where(models.Item.is_public==True))
+    total = count_result.scalar() or 0
+
+    if current_user:
+
+        followed_results = await db.execute(
+            select(models.Follow.following_id)
+            .where(models.Follow.follower_id == current_user.id)
+        )
+
+        followed_user_ids = [row[0] for row in followed_results.all()]
+
+        ranking_case =  case(
+            (models.Item.user_id.in_(followed_user_ids),1),
+            (models.Item.user_id == current_user.id, 2),
+            else_ = 3
+        )
+
+
+        query = (
+            select(models.Item)
+            .options(selectinload(models.Item.tags))
+            .where(models.Item.is_public == True)
+            .order_by(ranking_case, models.Item.created_at.desc())
+        )
+
+    else:
+
+        query = (
+            select(models.Item)
+            .options(selectinload(models.Item.tags))
+            .where(models.Item.is_public == True)
+            .order_by(models.Item.created_at.desc())
+        )
+
+    result = await db.execute(
+        query.offset(skip).limit(limit)
+    )
+
+    items = result.scalars().all()
+    
+    if not items:
+
+        return PaginatedFeedResponse(
+            items = [],
+            total = total,
+            skip = skip,
+            limit = limit,
+            has_more = False
+        )
+    
+    item_ids = [item.id for item in items]
+
+    likes_result = await db.execute( select(models.Like.item_id, func.count())
+                                    .where(models.Like.item_id.in_(item_ids))
+                                    .group_by(models.Like.item_id)
+)
+
+    likes_count = dict(likes_result.all())
+
+    comments_result = await db.execute(select(models.Comment.item_id, func.count(models.Comment.id))
+                                       .where(models.Comment.item_id.in_(item_ids))
+                                       .group_by(models.Comment.item_id)
+                                       )
+    
+    comments_count = dict(comments_result.all())
+
+    bookmarks_result = await db.execute(select(models.Bookmark.item_id, func.count(models.Bookmark.item_id))
+                                        .where(models.Bookmark.item_id.in_(item_ids))
+                                        .group_by(models.Bookmark.item_id)
+                                        )
+    
+    bookmarks_count = dict(bookmarks_result.all())
+
+    versions_result = await db.execute(select(models.Version.item_id, func.count(models.Version.id))
+                                       .where(models.Version.item_id.in_(item_ids))
+                                       .group_by(models.Version.item_id)
+                                       )
+    
+    versions_count = dict(versions_result.all())
+
+    feed=[]
+
+    for item in items:
+
+        feed.append({
+            "id" : item.id,
+            "user_id" : item.user_id,
+            "title" : item.title,
+            "content" : item.content,
+            "is_public" : item.is_public,
+            "created_at" : item.created_at,
+            "tags" : item.tags,
+
+            "likes_count" : likes_count.get(item.id, 0),
+            "comments_count" : comments_count.get(item.id, 0),
+            "bookmarks_count" : bookmarks_count.get(item.id, 0),
+            "versions_count" : versions_count.get(item.id, 0)
+        })
+
+    has_more = skip + len(items) < total
+
+
+    return PaginatedFeedResponse(
+        items = feed,
+        total = total,
+        skip = skip,
+        limit = limit,
+        has_more = has_more
+    )
+
+    
