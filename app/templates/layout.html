@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
 {% if title %}
-<title>blogpost - {{ title }}</title>
+<title>fastapi-blogpost - {{ title }}</title>
 {% else %}
-<title>blogpost</title>
+<title>fastapi-blogpost</title>
 {% endif %}
 
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -496,7 +496,7 @@ body {
 <nav class="navbar navbar-expand-md bg-steel fixed-top" data-bs-theme="dark">
 <div class="container">
 
-<a class="navbar-brand text-white" href="{{ url_for('home') }}">blogpost</a>
+<a class="navbar-brand text-white" href="{{ url_for('home') }}">fastapi-blogpost</a>
 
 <button class="navbar-toggler" data-bs-toggle="collapse" data-bs-target="#nav">
 <span class="navbar-toggler-icon"></span>
@@ -611,7 +611,7 @@ Account
 
             <div>
                 <h5 class="mb-0 fw-bold">
-                    About blogpost
+                    About fastapi-blogpost
                 </h5>
 
                 <small class="text-body-secondary">
@@ -662,7 +662,7 @@ Account
 </main>
 
 <footer class="mt-auto text-center py-3">
-© <span id="year"></span> blogpost
+© <span id="year"></span> fastapi-blogpost
 </footer>
 
 <!-- MODALS -->
@@ -759,18 +759,7 @@ setTheme(localStorage.getItem('theme') || 'auto');
 import { getCurrentUser, getToken } from '/static/js/auth.js';
 import { showModal, hideModal, getErrorMessage } from '/static/js/utils.js';
 
-// async function updateUI() {
-//     const user = await getCurrentUser();
-//     if (user) {
-//         loggedInNav.classList.remove('d-none');
-//         loggedOutNav.classList.add('d-none');
-//         accountBtn.textContent = user.username;
-//     } else {
-//         loggedInNav.classList.add('d-none');
-//         loggedOutNav.classList.remove('d-none');
-//     }
-// }
-// updateUI();
+
 async function updateUI() {
 
     const user = await getCurrentUser();
